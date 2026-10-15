@@ -429,30 +429,49 @@ func TestRunMainApp(t *testing.T) {
 
 	log := utils.GetLogger()
 
-	t.Run("logs nothing extra when execution succeeds", func(t *testing.T) {
+	t.Run("returns no error when execution succeeds", func(t *testing.T) {
 		t.Parallel()
 
 		runner := &mockRunner{}
-		// runMainApp should not panic and should invoke the root command
-		// against the provided runner without requiring a real KubeVirt client.
-		runMainApp(context.Background(), runner, log)
+		// runMainApp should invoke the root command against the provided
+		// runner without requiring a real KubeVirt client.
+		err := runMainApp(context.Background(), runner, log)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
 	})
 
-	t.Run("logs failure when execution returns a non-cancellation error", func(t *testing.T) {
+	t.Run("returns the error when execution fails", func(t *testing.T) {
 		t.Parallel()
 
 		runner := &mockRunner{createErr: errMainTestFailure}
-		runMainApp(context.Background(), runner, log)
+
+		err := runMainApp(context.Background(), runner, log)
+		if !errors.Is(err, errMainTestFailure) {
+			t.Fatalf("expected error wrapping %v, got %v", errMainTestFailure, err)
+		}
 	})
 
-	t.Run("suppresses logging when execution is cancelled", func(t *testing.T) {
+	t.Run("returns the error when the runner fails", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
+		runner := &mockRunner{waitErr: errMainTestFailure}
 
-		runner := &mockRunner{}
-		runMainApp(ctx, runner, log)
+		err := runMainApp(context.Background(), runner, log)
+		if !errors.Is(err, errMainTestFailure) {
+			t.Fatalf("expected error wrapping %v, got %v", errMainTestFailure, err)
+		}
+	})
+
+	t.Run("returns no error when execution is cancelled", func(t *testing.T) {
+		t.Parallel()
+
+		runner := &mockRunner{createErr: context.Canceled}
+
+		err := runMainApp(context.Background(), runner, log)
+		if err != nil {
+			t.Fatalf("expected cancellation to be treated as no error, got %v", err)
+		}
 	})
 }
 
@@ -464,7 +483,10 @@ func TestRunMainAppHonoursCleanupTimeout(t *testing.T) {
 	runner := &mockRunner{}
 	start := time.Now()
 
-	runMainApp(context.Background(), runner, utils.GetLogger())
+	err := runMainApp(context.Background(), runner, utils.GetLogger())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
 
 	end := time.Now()
 
@@ -478,11 +500,12 @@ func TestRunMainAppHonoursCleanupTimeout(t *testing.T) {
 	}
 }
 
-// TestMain_DirectInvocation exercises the real main() entrypoint directly
-// (in-process) rather than through a re-exec'd subprocess, so that its
-// statements are attributed to this test binary's coverage profile.
+// TestMain_DirectInvocation exercises run(), the body of the real main()
+// entrypoint, directly (in-process) rather than through a re-exec'd
+// subprocess, so that its statements are attributed to this test binary's
+// coverage profile. main() itself only passes run()'s result to os.Exit.
 //
-// These subtests intentionally avoid t.Parallel(): main() temporarily
+// These subtests intentionally avoid t.Parallel(): run() temporarily
 // overrides the process-wide os.Args so that cobra parses a controlled
 // argument list instead of the `go test` binary's own flags. Top-level tests
 // that call t.Parallel() defer their bodies until every non-parallel
@@ -492,18 +515,20 @@ func TestMain_DirectInvocation(t *testing.T) {
 	origArgs := os.Args
 	defer func() { os.Args = origArgs }()
 
-	t.Run("returns early when client/namespace resolution fails", func(t *testing.T) {
+	t.Run("fails early when client/namespace resolution fails", func(t *testing.T) {
 		os.Args = []string{"kar"}
 
 		t.Setenv("KUBECONFIG", writeTempKubeconfig(t, malformedKubeconfig))
 		t.Setenv("KAR_TELEMETRY_ENABLED", "false")
 
-		// main() should log the resolution error and return early, without
+		// run() should log the resolution error and fail early, without
 		// panicking or reaching the runner/command-execution setup below it.
-		main()
+		if code := run(); code != exitCodeFailure {
+			t.Fatalf("expected exit code %d, got %d", exitCodeFailure, code)
+		}
 	})
 
-	t.Run("proceeds through command execution", func(t *testing.T) {
+	t.Run("fails when command execution fails", func(t *testing.T) {
 		os.Args = []string{"kar"}
 
 		t.Setenv("KUBECONFIG", t.TempDir()+"/nonexistent-kubeconfig")
@@ -511,8 +536,10 @@ func TestMain_DirectInvocation(t *testing.T) {
 		t.Setenv("KAR_CLEANUP_TIMEOUT", "5s")
 
 		// With no jitconfig flag supplied, the root command's RunE fails fast
-		// (without making any real KubeVirt API call), so main() reaches the
-		// end of its body quickly.
-		main()
+		// (without making any real KubeVirt API call), so run() reaches the
+		// end of its body quickly and reports the failure.
+		if code := run(); code != exitCodeFailure {
+			t.Fatalf("expected exit code %d, got %d", exitCodeFailure, code)
+		}
 	})
 }

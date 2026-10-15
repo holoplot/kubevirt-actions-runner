@@ -47,6 +47,13 @@ When interrupted by `SIGTERM` or `Ctrl-C`,
 the runner stops waiting and removes the created resources
 within the configured cleanup timeout before it exits.
 
+The runner exits with code `0` when the VMI reaches `Succeeded`
+and with code `1` on any failure,
+for example a `Failed` VMI, an elapsed wait timeout,
+or an unreachable Kubernetes API.
+Actions Runner Controller retries a runner pod that exits with a non-zero code
+unless a job was already assigned to it.
+
 ## Centralized template strategy
 
 `--kubevirt-vm-template-namespace` lets you retrieve the VM template from a namespace

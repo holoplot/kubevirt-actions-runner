@@ -185,7 +185,9 @@ func getClientAndNamespace() (kubecli.KubevirtClient, string, error) {
 	return virtClient, namespace, nil
 }
 
-func runMainApp(ctx context.Context, kr runner.Runner, log *utils.LoggerImpl) {
+// runMainApp executes the root command and returns its error, if any. A
+// cancellation is not treated as a failure.
+func runMainApp(ctx context.Context, kr runner.Runner, log *utils.LoggerImpl) error {
 	var opts app.Opts
 
 	opts.CleanupTimeout = getDurationEnvOrDefault("KAR_CLEANUP_TIMEOUT", defaultCleanupTimeout)
@@ -195,10 +197,25 @@ func runMainApp(ctx context.Context, kr runner.Runner, log *utils.LoggerImpl) {
 	execErr := rootCmd.Execute()
 	if execErr != nil && !errors.Is(execErr, context.Canceled) {
 		log.Println("execute command failed:", execErr)
+
+		return fmt.Errorf("execute command failed: %w", execErr)
 	}
+
+	return nil
 }
 
+// exitCodeFailure is returned when the runner fails. Actions Runner Controller
+// then retries the runner pod unless a job was already assigned. Avoid exit
+// code 7, which ARC treats as an outdated runner.
+const exitCodeFailure = 1
+
 func main() {
+	os.Exit(run())
+}
+
+// run holds main's logic and returns the process exit code, so that deferred
+// cleanup such as the telemetry shutdown still runs before os.Exit.
+func run() int {
 	log := utils.GetLogger()
 	buildInfo := getBuildInfo(gitCommit, buildDate, gitTreeModified)
 	log.Printf("starting kubevirt action runner\ncommit: %v\tmodified: %v\tdate: %v\tgo: %v\n",
@@ -217,7 +234,7 @@ func main() {
 	if err != nil {
 		log.Warnf("error getting client or namespace: %v\n", err)
 
-		return
+		return exitCodeFailure
 	}
 
 	waitTimeout := getDurationEnvOrDefault("KAR_WAIT_TIMEOUT", defaultWaitTimeout)
@@ -235,5 +252,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	runMainApp(ctx, kubevirtRunner, log)
+	err = runMainApp(ctx, kubevirtRunner, log)
+	if err != nil {
+		return exitCodeFailure
+	}
+
+	return 0
 }
