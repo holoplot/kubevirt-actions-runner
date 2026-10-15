@@ -47,6 +47,9 @@ The runner exits its wait loop only when a terminal phase is observed:
 - **`Failed`** – the job failed;
   the runner returns an error and cleanup proceeds.
 
+If `KAR_WAIT_TIMEOUT` elapses before a terminal phase,
+the runner returns a timeout error and cleanup still proceeds.
+
 This means long-running jobs (jobs that keep the VM alive for many minutes
 or hours) are correctly tracked:
 the `Running + Ready` milestone tells you the VM became usable,

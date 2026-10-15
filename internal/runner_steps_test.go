@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime" //nolint:depguard // required by fake reactor signature
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	k8stesting "k8s.io/client-go/testing" //nolint:depguard // required by fake reactor signature
 	v1 "kubevirt.io/api/core/v1"
@@ -68,6 +70,7 @@ var (
 	errExpectedVMIName                  = errors.New("expected app context VMI name")
 	errExpectedCreateError              = errors.New("expected create error")
 	errExpectedDataVolumeNameContains   = errors.New("expected data volume name to contain substring")
+	errUnexpectedOwnerReferences        = errors.New("unexpected owner references on the created VMI")
 )
 
 // panicReporter turns gomock expectation violations into panics, which godog
@@ -397,6 +400,65 @@ func (rc *runnerCtx) appContextDataVolumeShouldContain(sub string) error {
 			sub,
 			appCtx.GetDataVolumeName(),
 		)
+	}
+
+	return nil
+}
+
+func (rc *runnerCtx) runnerPodIs(name, uid string) error {
+	kubevirtRunner, ok := rc.karRunner.(*runner.KubevirtRunner)
+	if !ok {
+		return fmt.Errorf("%w: runner is %T", errUnexpectedOwnerReferences, rc.karRunner)
+	}
+
+	kubevirtRunner.SetOwnerPod(name, uid)
+
+	return nil
+}
+
+func (rc *runnerCtx) getCreatedVMI(name string) (*v1.VirtualMachineInstance, error) {
+	vmi, err := rc.virtClientset.KubevirtV1().VirtualMachineInstances(k8sv1.NamespaceDefault).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get the created VMI %q: %w", name, err)
+	}
+
+	return vmi, nil
+}
+
+func (rc *runnerCtx) createdVMIShouldBeOwnedByPod(vmiName, podName, podUID string) error {
+	vmi, err := rc.getCreatedVMI(vmiName)
+	if err != nil {
+		return err
+	}
+
+	// blockOwnerDeletion=true would need extra RBAC (finalizers on pods), and
+	// the runner pod is not a controller of the VMI.
+	notSet := false
+	want := []metav1.OwnerReference{{
+		APIVersion:         "v1",
+		Kind:               "Pod",
+		Name:               podName,
+		UID:                types.UID(podUID),
+		Controller:         &notSet,
+		BlockOwnerDeletion: &notSet,
+	}}
+
+	if !reflect.DeepEqual(vmi.OwnerReferences, want) {
+		return fmt.Errorf("%w: want %+v, got %+v", errUnexpectedOwnerReferences, want, vmi.OwnerReferences)
+	}
+
+	return nil
+}
+
+func (rc *runnerCtx) createdVMIShouldHaveNoOwner(vmiName string) error {
+	vmi, err := rc.getCreatedVMI(vmiName)
+	if err != nil {
+		return err
+	}
+
+	if len(vmi.OwnerReferences) != 0 {
+		return fmt.Errorf("%w: want none, got %+v", errUnexpectedOwnerReferences, vmi.OwnerReferences)
 	}
 
 	return nil
@@ -805,6 +867,10 @@ func InitializeScenario(scenarioCtx *godog.ScenarioContext) {
 		runnerContext.createWithDataVolumeCreationFailure)
 	scenarioCtx.Step(`^resources with a data volume template are created successfully$`, runnerContext.createWithDataVolumeSuccess)
 	scenarioCtx.Step(`^the created app context data volume name should contain "([^"]*)"$`, runnerContext.appContextDataVolumeShouldContain)
+	scenarioCtx.Step(`^the runner pod is "([^"]*)" with uid "([^"]*)"$`, runnerContext.runnerPodIs)
+	scenarioCtx.Step(`^the created vmi "([^"]*)" should be owned by pod "([^"]*)" with uid "([^"]*)"$`,
+		runnerContext.createdVMIShouldBeOwnedByPod)
+	scenarioCtx.Step(`^the created vmi "([^"]*)" should have no owner references$`, runnerContext.createdVMIShouldHaveNoOwner)
 
 	scenarioCtx.Step(`^the app context is initialized with vmi "([^"]*)" and data volume "([^"]*)"$`, runnerContext.appContextInitialized)
 	scenarioCtx.Step(`^the app context is initialized with vmi "([^"]*)" and no data volume$`, runnerContext.appContextInitializedNoDV)

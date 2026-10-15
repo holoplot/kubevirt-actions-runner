@@ -23,9 +23,11 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
 	"github.com/electrocucaracha/kubevirt-actions-runner/cmd/kar/app"
+	runner "github.com/electrocucaracha/kubevirt-actions-runner/internal"
 	"github.com/spf13/cobra"
 )
 
@@ -37,7 +39,14 @@ var (
 	errWaitForVMINotCalled      = errors.New("WaitForVirtualMachineInstance was not called")
 	errDeleteResourcesNotCalled = errors.New("DeleteResources was not called")
 	errExpectedCommandFailure   = errors.New("expected command failure")
+	errDeleteCallCount          = errors.New("unexpected number of DeleteResources calls")
+	errCleanupContextCancelled  = errors.New("DeleteResources received a cancelled context")
+	errCleanupContextDeadline   = errors.New("DeleteResources received a context without a deadline")
+	errCleanupContextUnbounded  = errors.New("DeleteResources received a context with a deadline")
 )
+
+// cleanupTimeout is the cleanup window passed to the root command in tests.
+const cleanupTimeout = 5 * time.Minute
 
 // mock implements the runner.Runner interface for exercising the root command.
 type mock struct {
@@ -46,7 +55,10 @@ type mock struct {
 	waitErr      error
 	createCalled bool
 	waitCalled   bool
-	deleteCalled bool
+	deleteCalls  int
+	deleteCtxErr error
+	deleteHasDL  bool
+	onWait       func()
 	vmTemplate   string
 	vmTemplateNS string
 	runnerName   string
@@ -73,11 +85,17 @@ func (m *mock) CreateResources(
 func (m *mock) WaitForVirtualMachineInstance(_ context.Context) error {
 	m.waitCalled = true
 
+	if m.onWait != nil {
+		m.onWait()
+	}
+
 	return m.waitErr
 }
 
-func (m *mock) DeleteResources(_ context.Context) error {
-	m.deleteCalled = true
+func (m *mock) DeleteResources(ctx context.Context) error {
+	m.deleteCalls++
+	m.deleteCtxErr = ctx.Err()
+	_, m.deleteHasDL = ctx.Deadline()
 
 	return m.deleteErr
 }
@@ -90,16 +108,44 @@ type rootCmdCtx struct {
 
 func (rc *rootCmdCtx) reset(ctx context.Context, _ *godog.Scenario) (context.Context, error) {
 	rc.runner = new(mock)
-
-	var opts app.Opts
-
-	rc.cmd = app.NewRootCommand(context.TODO(), rc.runner, opts)
+	rc.cmd = newTestRootCommand(context.TODO(), rc.runner)
 	rc.result = nil
 
 	return ctx, nil
 }
 
+func newTestRootCommand(ctx context.Context, r runner.Runner) *cobra.Command {
+	var opts app.Opts
+
+	opts.CleanupTimeout = cleanupTimeout
+
+	return app.NewRootCommand(ctx, r, opts)
+}
+
 func (rc *rootCmdCtx) aMockRunner() error {
+	return nil
+}
+
+func (rc *rootCmdCtx) aMockRunnerWithoutCleanupTimeout() error {
+	var opts app.Opts
+
+	rc.cmd = app.NewRootCommand(context.TODO(), rc.runner, opts)
+
+	return nil
+}
+
+// aMockRunnerInterruptedBySignal simulates a SIGTERM arriving while the
+// runner waits: the parent context is cancelled and the wait returns.
+func (rc *rootCmdCtx) aMockRunnerInterruptedBySignal() error {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	rc.runner.onWait = func() {
+		cancel()
+
+		rc.runner.waitErr = ctx.Err()
+	}
+	rc.cmd = newTestRootCommand(ctx, rc.runner)
+
 	return nil
 }
 
@@ -119,6 +165,8 @@ func (rc *rootCmdCtx) executeRootCommand(flag, value, failure string) error {
 		rc.runner.deleteErr = errExpectedFailure
 	case "wait":
 		rc.runner.waitErr = errExpectedFailure
+	case "runner failed":
+		rc.runner.waitErr = runner.ErrRunnerFailed
 	}
 
 	rc.result = rc.cmd.Execute()
@@ -167,12 +215,28 @@ func (rc *rootCmdCtx) executeRootCommand(flag, value, failure string) error {
 		return errWaitForVMINotCalled
 	}
 
-	if failure == "wait" {
-		return nil
+	if rc.runner.deleteCalls == 0 {
+		return errDeleteResourcesNotCalled
 	}
 
-	if !rc.runner.deleteCalled {
-		return errDeleteResourcesNotCalled
+	return nil
+}
+
+func (rc *rootCmdCtx) deleteResourcesShouldBeCalled(count int) error {
+	if rc.runner.deleteCalls != count {
+		return fmt.Errorf("%w: want %d, got %d", errDeleteCallCount, count, rc.runner.deleteCalls)
+	}
+
+	return nil
+}
+
+func (rc *rootCmdCtx) cleanupContextShouldBeLive() error {
+	if rc.runner.deleteCtxErr != nil {
+		return fmt.Errorf("%w: %w", errCleanupContextCancelled, rc.runner.deleteCtxErr)
+	}
+
+	if !rc.runner.deleteHasDL {
+		return errCleanupContextDeadline
 	}
 
 	return nil
@@ -193,15 +257,31 @@ func (rc *rootCmdCtx) commandExecutionShould(outcome string) error {
 	return nil
 }
 
+func (rc *rootCmdCtx) cleanupContextShouldBeUnbounded() error {
+	if rc.runner.deleteHasDL {
+		return errCleanupContextUnbounded
+	}
+
+	return nil
+}
+
 func InitializeScenario(scenarioCtx *godog.ScenarioContext) {
 	rootCtx := new(rootCmdCtx)
 
 	scenarioCtx.Before(rootCtx.reset)
 
 	scenarioCtx.Step(`^a mock runner$`, rootCtx.aMockRunner)
+	scenarioCtx.Step(`^a mock runner whose wait is interrupted by a termination signal$`,
+		rootCtx.aMockRunnerInterruptedBySignal)
+	scenarioCtx.Step(`^a mock runner without a cleanup timeout$`, rootCtx.aMockRunnerWithoutCleanupTimeout)
 	scenarioCtx.Step(`^the root command is executed with flag "([^"]*)" value "([^"]*)" and induced failure "([^"]*)"$`,
 		rootCtx.executeRootCommand)
 	scenarioCtx.Step(`^the command execution should "([^"]*)"$`, rootCtx.commandExecutionShould)
+	scenarioCtx.Step(`^DeleteResources should be called (\d+) times?$`, rootCtx.deleteResourcesShouldBeCalled)
+	scenarioCtx.Step(`^DeleteResources should receive a live context with a deadline$`,
+		rootCtx.cleanupContextShouldBeLive)
+	scenarioCtx.Step(`^DeleteResources should receive a context without a deadline$`,
+		rootCtx.cleanupContextShouldBeUnbounded)
 }
 
 func TestFeatures(t *testing.T) {

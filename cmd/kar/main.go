@@ -145,15 +145,6 @@ func getDurationEnvOrDefault(key string, defaultValue time.Duration) time.Durati
 	return defaultValue
 }
 
-func ensureValidCleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
-	cleanupTimeout := getDurationEnvOrDefault("KAR_CLEANUP_TIMEOUT", defaultCleanupTimeout)
-	if parent.Err() != nil {
-		return context.WithTimeout(context.Background(), cleanupTimeout)
-	}
-
-	return context.WithTimeout(parent, cleanupTimeout)
-}
-
 func setupTelemetry(ctx context.Context, log *utils.LoggerImpl) func(context.Context) error {
 	shutdownTelemetry, err := runner.InitializeTelemetry(ctx)
 	if err != nil {
@@ -173,18 +164,6 @@ func shutdownTelemetryAndLog(
 	err := shutdownTelemetry(ctx)
 	if err != nil {
 		log.Warnf("failed to shutdown telemetry: %v", err)
-	}
-}
-
-// runCleanup deletes the runner's KubeVirt resources once the parent context
-// is done, logging any failure returned by DeleteResources.
-func runCleanup(ctx context.Context, kr runner.Runner, log *utils.LoggerImpl) {
-	cleanupCtx, cancel := ensureValidCleanupContext(ctx)
-	defer cancel()
-
-	err := kr.DeleteResources(cleanupCtx)
-	if err != nil {
-		log.Println("cleanup failed:", err)
 	}
 }
 
@@ -208,6 +187,8 @@ func getClientAndNamespace() (kubecli.KubevirtClient, string, error) {
 
 func runMainApp(ctx context.Context, kr runner.Runner, log *utils.LoggerImpl) {
 	var opts app.Opts
+
+	opts.CleanupTimeout = getDurationEnvOrDefault("KAR_CLEANUP_TIMEOUT", defaultCleanupTimeout)
 
 	rootCmd := app.NewRootCommand(ctx, kr, opts)
 
@@ -241,18 +222,18 @@ func main() {
 
 	waitTimeout := getDurationEnvOrDefault("KAR_WAIT_TIMEOUT", defaultWaitTimeout)
 	kubevirtRunner := runner.NewRunner(namespace, virtClient, waitTimeout)
+	// POD_NAME and POD_UID come from the downward API. When both are set the
+	// VMI is owned by this pod, so Kubernetes garbage-collects it if kar is
+	// killed before it can delete the VMI itself.
+	kubevirtRunner.SetOwnerPod(os.Getenv("POD_NAME"), os.Getenv("POD_UID"))
 
 	log.Printf("cleanup timeout is set to: %v", getDurationEnvOrDefault("KAR_CLEANUP_TIMEOUT", defaultCleanupTimeout))
 	log.Printf("wait timeout is set to: %v", waitTimeout)
 
+	// A termination signal cancels ctx, which ends the wait; the root command
+	// then deletes the runner resources before runMainApp returns.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	go func() {
-		<-ctx.Done()
-
-		runCleanup(ctx, kubevirtRunner, log)
-	}()
 
 	runMainApp(ctx, kubevirtRunner, log)
 }

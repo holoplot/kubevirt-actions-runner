@@ -18,10 +18,15 @@ limitations under the License.
 
 package app
 
+import "time"
+
 // Opts stores all the options for configuring the root kar command.
 type Opts struct {
 	VMTemplate          string
 	VMTemplateNamespace string
 	RunnerName          string
 	JitConfig           string
+	// CleanupTimeout bounds how long deleting the runner resources may take.
+	// It is not exposed as a flag; main fills it from KAR_CLEANUP_TIMEOUT.
+	CleanupTimeout time.Duration
 }
