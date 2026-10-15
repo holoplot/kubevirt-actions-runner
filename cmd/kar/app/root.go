@@ -20,7 +20,9 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	runner "github.com/electrocucaracha/kubevirt-actions-runner/internal"
 	"github.com/electrocucaracha/kubevirt-actions-runner/internal/utils"
@@ -44,15 +46,25 @@ func NewRootCommand(ctx context.Context, runner runner.Runner, opts Opts) *cobra
 	return cmd
 }
 
-func run(ctx context.Context, runner runner.Runner, opts Opts) error {
+func run(ctx context.Context, runner runner.Runner, opts Opts) (err error) {
 	log := utils.GetLogger()
 
-	err := runner.CreateResources(ctx, opts.VMTemplate, opts.VMTemplateNamespace, opts.RunnerName, opts.JitConfig)
+	err = runner.CreateResources(ctx, opts.VMTemplate, opts.VMTemplateNamespace, opts.RunnerName, opts.JitConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create resources: %w", err)
 	}
 
 	log.Println("Virtual Machine runner resources created successfully")
+
+	// Delete the resources on every exit path, including a wait timeout, a
+	// failed runner or a termination signal. Otherwise a leaked VMI keeps
+	// holding scarce node devices (e.g. GPUs) after the runner pod is gone.
+	defer func() {
+		deleteErr := deleteResources(ctx, runner, opts.CleanupTimeout)
+		if deleteErr != nil {
+			err = errors.Join(err, deleteErr)
+		}
+	}()
 
 	err = runner.WaitForVirtualMachineInstance(ctx)
 	if err != nil {
@@ -61,12 +73,28 @@ func run(ctx context.Context, runner runner.Runner, opts Opts) error {
 
 	log.Println("Virtual Machine runner completed successfully")
 
-	err = runner.DeleteResources(ctx)
+	return nil
+}
+
+// deleteResources deletes the runner resources with a context that outlives
+// the cancellation of ctx, so cleanup still runs after a termination signal.
+// A positive cleanupTimeout bounds how long the deletion may take.
+func deleteResources(ctx context.Context, runner runner.Runner, cleanupTimeout time.Duration) error {
+	cleanupCtx := context.WithoutCancel(ctx)
+
+	if cleanupTimeout > 0 {
+		var cancel context.CancelFunc
+
+		cleanupCtx, cancel = context.WithTimeout(cleanupCtx, cleanupTimeout)
+		defer cancel()
+	}
+
+	err := runner.DeleteResources(cleanupCtx)
 	if err != nil {
 		return fmt.Errorf("failed to delete resources: %w", err)
 	}
 
-	log.Println("Virtual Machine runner deleted successfully")
+	utils.GetLogger().Println("Virtual Machine runner deleted successfully")
 
 	return nil
 }

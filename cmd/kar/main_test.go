@@ -34,9 +34,10 @@ var errMainTestFailure = errors.New("simulated failure")
 // mockRunner is a lightweight stand-in for runner.Runner used to exercise
 // runMainApp without touching a real KubeVirt client.
 type mockRunner struct {
-	createErr error
-	waitErr   error
-	deleteErr error
+	createErr      error
+	waitErr        error
+	deleteErr      error
+	deleteDeadline time.Time
 }
 
 func (m *mockRunner) CreateResources(_ context.Context, _, _, _, _ string) error {
@@ -47,7 +48,9 @@ func (m *mockRunner) WaitForVirtualMachineInstance(_ context.Context) error {
 	return m.waitErr
 }
 
-func (m *mockRunner) DeleteResources(_ context.Context) error {
+func (m *mockRunner) DeleteResources(ctx context.Context) error {
+	m.deleteDeadline, _ = ctx.Deadline()
+
 	return m.deleteErr
 }
 
@@ -248,47 +251,6 @@ func TestGetDurationEnvOrDefault(t *testing.T) {
 	}
 }
 
-func TestEnsureValidCleanupContext(t *testing.T) {
-	t.Parallel()
-
-	t.Run("derives a fresh context when parent is already cancelled", func(t *testing.T) {
-		t.Parallel()
-
-		parentCtx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		cleanupCtx, cleanupCancel := ensureValidCleanupContext(parentCtx)
-		defer cleanupCancel()
-
-		err := cleanupCtx.Err()
-		if err != nil {
-			t.Fatalf("expected fresh context to not be cancelled, got err=%v", err)
-		}
-
-		if _, ok := cleanupCtx.Deadline(); !ok {
-			t.Fatal("expected cleanup context to have a deadline")
-		}
-	})
-
-	t.Run("derives from parent when parent is still valid", func(t *testing.T) {
-		t.Parallel()
-
-		parentCtx := context.Background()
-
-		cleanupCtx, cleanupCancel := ensureValidCleanupContext(parentCtx)
-		defer cleanupCancel()
-
-		err := cleanupCtx.Err()
-		if err != nil {
-			t.Fatalf("expected context derived from valid parent to not be cancelled, got err=%v", err)
-		}
-
-		if _, ok := cleanupCtx.Deadline(); !ok {
-			t.Fatal("expected cleanup context to have a deadline")
-		}
-	})
-}
-
 // malformedKubeconfig is intentionally invalid YAML so that client config
 // loading fails while parsing, exercising the namespace-resolution error path
 // of getClientAndNamespace.
@@ -462,26 +424,6 @@ func TestShutdownTelemetryAndLog(t *testing.T) {
 	})
 }
 
-func TestRunCleanup(t *testing.T) {
-	t.Parallel()
-
-	log := utils.GetLogger()
-
-	t.Run("does not log when DeleteResources succeeds", func(t *testing.T) {
-		t.Parallel()
-
-		runner := &mockRunner{}
-		runCleanup(context.Background(), runner, log)
-	})
-
-	t.Run("logs cleanup failure when DeleteResources returns an error", func(t *testing.T) {
-		t.Parallel()
-
-		runner := &mockRunner{deleteErr: errMainTestFailure}
-		runCleanup(context.Background(), runner, log)
-	})
-}
-
 func TestRunMainApp(t *testing.T) {
 	t.Parallel()
 
@@ -514,6 +456,28 @@ func TestRunMainApp(t *testing.T) {
 	})
 }
 
+// TestRunMainAppHonoursCleanupTimeout checks that KAR_CLEANUP_TIMEOUT bounds
+// the resource deletion that the root command performs before returning.
+func TestRunMainAppHonoursCleanupTimeout(t *testing.T) {
+	t.Setenv("KAR_CLEANUP_TIMEOUT", "7s")
+
+	runner := &mockRunner{}
+	start := time.Now()
+
+	runMainApp(context.Background(), runner, utils.GetLogger())
+
+	end := time.Now()
+
+	if runner.deleteDeadline.IsZero() {
+		t.Fatal("expected DeleteResources to receive a context with a deadline")
+	}
+
+	if runner.deleteDeadline.Before(start.Add(7*time.Second)) || runner.deleteDeadline.After(end.Add(7*time.Second)) {
+		t.Fatalf("expected the cleanup deadline 7s after the cleanup started, got %v after the start",
+			runner.deleteDeadline.Sub(start))
+	}
+}
+
 // TestMain_DirectInvocation exercises the real main() entrypoint directly
 // (in-process) rather than through a re-exec'd subprocess, so that its
 // statements are attributed to this test binary's coverage profile.
@@ -539,7 +503,7 @@ func TestMain_DirectInvocation(t *testing.T) {
 		main()
 	})
 
-	t.Run("proceeds through command execution and signal-triggered cleanup", func(t *testing.T) {
+	t.Run("proceeds through command execution", func(t *testing.T) {
 		os.Args = []string{"kar"}
 
 		t.Setenv("KUBECONFIG", t.TempDir()+"/nonexistent-kubeconfig")
@@ -548,15 +512,7 @@ func TestMain_DirectInvocation(t *testing.T) {
 
 		// With no jitconfig flag supplied, the root command's RunE fails fast
 		// (without making any real KubeVirt API call), so main() reaches the
-		// end of its body quickly. Its deferred stop() then cancels the
-		// signal-notification context, unblocking the cleanup goroutine,
-		// which attempts (and fails fast against) a real DeleteResources
-		// call, exercising that goroutine's error-logging path as well.
+		// end of its body quickly.
 		main()
-
-		// Give the cleanup goroutine a brief moment to finish running before
-		// this subtest returns, so its coverage counters are recorded
-		// deterministically rather than racing the test binary's exit.
-		time.Sleep(200 * time.Millisecond)
 	})
 }

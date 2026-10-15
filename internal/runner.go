@@ -72,6 +72,7 @@ type KubevirtRunner struct {
 	virtClient  kubecli.KubevirtClient
 	namespace   string
 	waitTimeout time.Duration
+	ownerPod    *k8smetav1.OwnerReference
 }
 
 var _ Runner = (*KubevirtRunner)(nil)
@@ -81,6 +82,28 @@ func NewRunner(namespace string, virtClient kubecli.KubevirtClient, waitTimeout 
 		namespace:   namespace,
 		virtClient:  virtClient,
 		waitTimeout: waitTimeout,
+	}
+}
+
+// SetOwnerPod records the pod running kar so the VMI it creates is owned by
+// that pod and garbage-collected along with it, even if kar never gets the
+// chance to delete it. The ownership is skipped unless both values are set.
+func (rc *KubevirtRunner) SetOwnerPod(name, uid string) {
+	if name == "" || uid == "" {
+		rc.ownerPod = nil
+
+		return
+	}
+
+	// blockOwnerDeletion stays false so no extra RBAC on pods/finalizers is
+	// needed, and the pod is not the VMI's controller.
+	rc.ownerPod = &k8smetav1.OwnerReference{
+		APIVersion:         "v1",
+		Kind:               "Pod",
+		Name:               name,
+		UID:                types.UID(uid),
+		Controller:         new(bool),
+		BlockOwnerDeletion: new(bool),
 	}
 }
 
@@ -564,6 +587,10 @@ func (rc *KubevirtRunner) getResources(
 
 	virtualMachineInstance := v1.NewVMIReferenceFromNameWithNS(rc.namespace, runnerName)
 	virtualMachineInstance.Spec = virtualMachine.Spec.Template.Spec
+
+	if rc.ownerPod != nil {
+		virtualMachineInstance.OwnerReferences = []k8smetav1.OwnerReference{*rc.ownerPod}
+	}
 
 	if virtualMachineInstance.Annotations == nil {
 		virtualMachineInstance.Annotations = make(map[string]string)

@@ -149,3 +149,16 @@ Feature: Runner resource lifecycle
   Scenario: VMI disappears before the watch can be re-established
     When the vmi becomes Running then the first watch stream closes and the vmi is no longer found
     Then the operation should fail with an error containing "failed to get the virtual machine instance"
+
+  Scenario Outline: The created VMI is owned by the runner pod only when the pod is known
+    Given the runner pod is "<podName>" with uid "<podUID>"
+    When resources are created with vm template "vm-template", runner name "<runnerName>" and jit config "jitConfig"
+    Then the create result should be "success"
+    And the created vmi "<runnerName>" should <ownership>
+
+    Examples:
+      | podName    | podUID   | runnerName     | ownership                                                |
+      | runner-pod | uid-1234 | runner-owned   | be owned by pod "runner-pod" with uid "uid-1234"         |
+      |            |          | runner-unowned | have no owner references                                 |
+      | runner-pod |          | runner-no-uid  | have no owner references                                 |
+      |            | uid-1234 | runner-no-name | have no owner references                                 |

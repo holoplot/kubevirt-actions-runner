@@ -41,9 +41,11 @@ Execution sequence:
 1. Wait for the target VirtualMachineInstance to complete.
 1. Delete resources created by the runner.
 
+The runner deletes the resources it created on every exit path,
+including a failed VMI and an elapsed wait timeout.
 When interrupted by `SIGTERM` or `Ctrl-C`,
-the runner enters cleanup and attempts to remove created resources
-within the configured cleanup timeout.
+the runner stops waiting and removes the created resources
+within the configured cleanup timeout before it exits.
 
 ## Centralized template strategy
 

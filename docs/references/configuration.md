@@ -51,6 +51,20 @@ This enables a single golden template strategy,
 so multiple runner namespaces can clone from one controlled source
 without duplicating template objects.
 
+## Ownership configuration
+
+| Variable   | Default | Description                                                   |
+| ---------- | ------- | ------------------------------------------------------------- |
+| `POD_NAME` | empty   | Name of the runner Pod, from the downward API `metadata.name` |
+| `POD_UID`  | empty   | UID of the runner Pod, from the downward API `metadata.uid`   |
+
+When both `POD_NAME` and `POD_UID` are set,
+the VirtualMachineInstance gets an owner reference to the runner Pod.
+Kubernetes then deletes the VirtualMachineInstance together with the Pod,
+even if the runner is killed before it can clean up.
+The owner reference sets `blockOwnerDeletion: false`,
+so it needs no extra RBAC permissions.
+
 ## Related guides
 
 - To configure telemetry in practice,
